@@ -13,9 +13,9 @@ from pypinyin import pinyin, Style
 
 class VoiceManager:
     def __init__(self):
+        # 统一使用标准的 44100Hz，避免频繁 init/quit 导致爆音
         try:
-            # 默认以 8000Hz 初始化，匹配 Yukkuri 采样率
-            pygame.mixer.init(frequency=8000)
+            pygame.mixer.init(frequency=44100)
         except Exception as e:
             print(f"音频初始化提示: {e}")
 
@@ -29,7 +29,7 @@ class VoiceManager:
         self.dict_file = "mapping.tsv"
         self.kana_dict = self._load_mapping_tsv(self.dict_file)
 
-        # 字母及数字发音拟音表
+        # 字母及数字发音拟音表 (Yukkuri 专用)
         self.alpha_map = {
             'a': 'ee', 'b': 'bii', 'c': 'shii', 'd': 'dei', 'e': 'ii',
             'f': 'efu', 'g': 'jii', 'h': 'ecchi', 'i': 'ai', 'j': 'jee',
@@ -46,10 +46,10 @@ class VoiceManager:
             self.aq_lib.AquesTalk_Synthe.restype = ctypes.c_void_p
             self.aq_lib.AquesTalk_Synthe.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.POINTER(ctypes.c_int)]
             self.aq_lib.AquesTalk_FreeWave.argtypes = [ctypes.c_void_p]
-            print(f"✅ 语音引擎就绪 (WanaKana 自动适配模式)")
+            print(f"✅ 语音引擎就绪 (原生 DLL 模式)")
         except:
             self.aq_lib = None
-            print("⚠️ AquesTalk DLL 加载失败")
+            print("⚠️ AquesTalk DLL 加载失败，油库里模式将不可用")
 
     def _load_mapping_tsv(self, filepath):
         mapping = {}
@@ -64,50 +64,46 @@ class VoiceManager:
         return mapping
 
     def _pinyin_to_kana(self, text):
-        """核心转换逻辑"""
+        """将中文/英文转换为 Yukkuri 识别的假名符号流"""
         py_results = pinyin(text, style=Style.NORMAL, errors='default')
         kana_out_list = []
-
-        # 🟢 自动获取转换函数（适配不同版本的 wanakana 库）
         to_kana_fn = getattr(wanakana, 'to_katakana', getattr(wanakana, 'to_kana', None))
 
         for item in py_results:
             token = item[0].lower()
-
-            # 1. 查本地字典
             if token in self.kana_dict:
                 kana_out_list.append(self.kana_dict[token])
-            # 2. 处理英文和数字
             elif re.match(r'[a-z0-9.]+', token):
                 if len(token) == 1 or re.match(r'^[0-9.]+$', token):
-                    for char in token:
-                        kana_out_list.append(self.alpha_map.get(char, ""))
+                    for char in token: kana_out_list.append(self.alpha_map.get(char, ""))
                 elif to_kana_fn:
-                    # 如果是单词，尝试让 wanakana 转换
                     kana_out_list.append(to_kana_fn(token))
-                else:
-                    kana_out_list.append(token)
             else:
-                kana_out_list.append(token)
+                # 尝试通过 wanakana 兜底处理无法识别的部分
+                if to_kana_fn: kana_out_list.append(to_kana_fn(token))
 
         combined_text = "".join(kana_out_list)
-        # 再次确认通过假名转换
-        final_kana = to_kana_fn(combined_text) if to_kana_fn else combined_text
-
-        # 净化正则
+        # 净化逻辑：只保留假名和基础标点，避免 DLL 崩溃
         pattern = r'[\u3040-\u309F\u30A0-\u30FF\u30FC\u3001\u3002\uFF01\uFF1F]'
-        return "".join(re.findall(pattern, final_kana))
+        return "".join(re.findall(pattern, combined_text))
 
     def speak(self, text):
-        """语音播放入口"""
+        """语音播放入口，支持打断"""
+        if not text: return
+
+        # 打断当前正在播放的声音
+        self.stop_event.set()
+        if pygame.mixer.get_init():
+            pygame.mixer.music.stop()
+
+        # 给一点时间让旧线程退出
+        time.sleep(0.1)
         self.stop_event.clear()
-        if not text or self.is_playing: return
         self.is_playing = True
 
-        # 🟢 过滤百科开头废话，从第一个标题处开始读
+        # 过滤 Markdown 和多余换行
         start_idx = text.find("###")
         final_content = text[start_idx:] if start_idx != -1 else text
-
         clean_msg = re.sub(r'[#\*]', '', final_content)
         clean_msg = re.sub(r'\n+', '。', clean_msg)
 
@@ -119,13 +115,16 @@ class VoiceManager:
 
     def _yukkuri_process(self, text):
         try:
+            # 句子切分，避免单次合成过长
             sentences = [s.strip() for s in re.split(r'[，。！？\n,;!?:()]', text) if s.strip()]
             for s in sentences:
                 if self.stop_event.is_set(): break
-                kana_str = self._pinyin_to_kana(s) + "。"
-                if not kana_str.strip("。"): continue
 
-                encoded_data = kana_str.encode('shift-jis', errors='ignore') + b'\x00'
+                kana_str = self._pinyin_to_kana(s)
+                if not kana_str: continue
+
+                # AquesTalk 合成参数：100 为基准语速，建议 120-130 更有油库里味
+                encoded_data = (kana_str + "。").encode('shift-jis', errors='ignore') + b'\x00'
                 size = ctypes.c_int(0)
                 wav_ptr = self.aq_lib.AquesTalk_Synthe(encoded_data, 100, ctypes.byref(size))
 
@@ -134,9 +133,12 @@ class VoiceManager:
                     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tf:
                         temp_file = tf.name
                         tf.write(wav_data)
+
                     self.active_temp_files.add(temp_file)
                     self.aq_lib.AquesTalk_FreeWave(wav_ptr)
-                    self._play_worker(temp_file, freq=8000)
+
+                    # 播放
+                    self._play_worker(temp_file)
                     self._cleanup_file(temp_file)
         finally:
             self.is_playing = False
@@ -149,27 +151,34 @@ class VoiceManager:
             try:
                 communicate = edge_tts.Communicate(text, voice)
                 await communicate.save(output)
-                if not self.stop_event.is_set(): self._play_worker(output, freq=44100)
+                if not self.stop_event.is_set():
+                    self._play_worker(output)
             finally:
                 self._cleanup_file(output)
                 self.is_playing = False
 
-        asyncio.run(_task())
+        # 解决 asyncio.run 可能在线程中冲突的问题
+        new_loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(new_loop)
+        new_loop.run_until_complete(_task())
 
-    def _play_worker(self, file_path, freq=44100):
+    def _play_worker(self, file_path):
+        """通用的播放执行器，无需重启 mixer"""
         try:
-            pygame.mixer.quit()
-            pygame.mixer.init(frequency=freq)
+            if not pygame.mixer.get_init():
+                pygame.mixer.init()
+
             pygame.mixer.music.load(file_path)
             pygame.mixer.music.play()
+
             while pygame.mixer.music.get_busy():
                 if self.stop_event.is_set():
                     pygame.mixer.music.stop()
                     break
-                pygame.time.Clock().tick(10)
+                time.sleep(0.05)
             pygame.mixer.music.unload()
-        except:
-            pass
+        except Exception as e:
+            print(f"播放异常: {e}")
 
     def _cleanup_file(self, path):
         try:
@@ -183,11 +192,12 @@ class VoiceManager:
         try:
             if pygame.mixer.get_init():
                 pygame.mixer.music.stop()
-                pygame.mixer.music.unload()
                 pygame.mixer.quit()
         except:
             pass
         for path in list(self.active_temp_files): self._cleanup_file(path)
 
     def set_mode(self, mode_name):
-        if mode_name in self.voices: self.current_mode = mode_name
+        if mode_name in self.voices:
+            self.current_mode = mode_name
+            print(f"🎤 语音模式切换至: {mode_name}")

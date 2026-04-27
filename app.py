@@ -335,13 +335,13 @@ class App(QMainWindow):
         self.btn_speak.show()
 
     def on_speak_clicked(self):
-        """朗读正文的第一句话，带状态保护"""
+        """朗读正文全文，既然 Prompt 已经优化过长度"""
         if self.voice_mgr.is_playing:
             self.statusBar().showMessage("🕒 语音引擎正在忙碌...")
             return
 
         if self.current_name and self.current_wiki:
-            # 停止当前可能存在的残留播放
+            # 1. 停止当前可能存在的残留播放
             import pygame
             try:
                 if pygame.mixer.get_init():
@@ -349,17 +349,28 @@ class App(QMainWindow):
             except:
                 pass
 
-            # 解析文本：跳过“引擎：XXX”标注，提取正文
+            # 2. 解析文本：跳过“引擎：XXX”这种元数据标注
+            # 假设你的格式依然是：引擎信息 \n\n 百科内容 \n\n 候选
             parts = self.current_wiki.split('\n\n')
-            # 假设格式是：[0]引擎信息 [1]百科内容
-            main_text = parts[1] if len(parts) > 1 else parts[0]
 
-            # 只取第一句
-            intro = main_text.split('。')[0]
-            if not intro.strip():
-                intro = self.current_name
+            # 找到真正的百科描述部分
+            # 我们排除掉第一行（引擎名）和包含“【候选】”的部分
+            main_content_parts = []
+            for p in parts:
+                p = p.strip()
+                if not p.startswith("引擎：") and not p.startswith("【候选】"):
+                    main_content_parts.append(p)
 
-            full_speech = f"识别结果：{self.current_name}。{intro}"
+            # 合并剩下的正文
+            full_content = " ".join(main_content_parts)
+
+            # 如果正文解析失败，至少读个名字
+            if not full_content.strip():
+                full_content = self.current_name
+
+            # 3. 拼接最终要读的话
+            # 不再使用 .split('。')[0]，直接读全文
+            full_speech = f"识别结果：{self.current_name}。{full_content}"
 
             self.statusBar().showMessage(f"🎙️ 正在播放：{self.current_name}")
             self.voice_mgr.speak(full_speech)
