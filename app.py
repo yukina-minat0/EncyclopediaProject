@@ -9,13 +9,18 @@ from PyQt6.QtWidgets import *
 from PyQt6.QtGui import *
 from PyQt6.QtCore import *
 
-# 假设你的引擎文件都在同级目录下
+# 引擎导入
 from vision import VisionEngine
 from deepseek_engine import DeepSeekEngine
 from anime_engine import AnimeEngine
+from voice_manager import VoiceManager
 
-# 限制线程数，防止 CPU 抢占导致 UI 卡顿
+# 限制线程数
 torch.set_num_threads(1)
+
+class SelectMode(Enum):
+    BOX = 0
+    POINT = 1
 
 
 class SelectMode(Enum):
@@ -24,14 +29,14 @@ class SelectMode(Enum):
 
 
 # =========================
-# 🎨 自绘画布
+# 🎨 自绘画布 (保持原样)
 # =========================
 class ImageCanvas(QWidget):
     area_selected = pyqtSignal(QRect)
     point_clicked = pyqtSignal(QPoint)
 
-    def __init__(self):
-        super().__init__()
+    def __init__(self, parent=None):
+        super().__init__(parent)
         self.image = None
         self.begin = None
         self.end = None
@@ -46,31 +51,21 @@ class ImageCanvas(QWidget):
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.fillRect(self.rect(), QColor("#1e1e1e"))
-
-        if self.image is None:
-            return
+        if self.image is None: return
 
         h, w = self.image.shape[:2]
         rgb = cv2.cvtColor(self.image, cv2.COLOR_BGR2RGB)
         qimg = QImage(rgb.data, w, h, w * 3, QImage.Format.Format_RGB888)
 
-        scale_w = self.width() / w
-        scale_h = self.height() / h
+        scale_w, scale_h = self.width() / w, self.height() / h
         self.scale = min(scale_w, scale_h)
-
-        new_w = int(w * self.scale)
-        new_h = int(h * self.scale)
-
-        self.offset = QPoint(
-            (self.width() - new_w) // 2,
-            (self.height() - new_h) // 2
-        )
+        new_w, new_h = int(w * self.scale), int(h * self.scale)
+        self.offset = QPoint((self.width() - new_w) // 2, (self.height() - new_h) // 2)
 
         painter.drawImage(QRect(self.offset, QSize(new_w, new_h)), qimg)
-
         if self.begin and self.end:
             painter.setPen(QPen(QColor(0, 255, 127), 2, Qt.PenStyle.DashLine))
-            painter.drawRect(QRect(self.begin, self.end))
+            painter.drawRect(QRect(self.begin, self.end).normalized())
 
     def mousePressEvent(self, e):
         self.begin = e.position().toPoint()
@@ -86,13 +81,10 @@ class ImageCanvas(QWidget):
         if self.begin:
             self.end = e.position().toPoint()
             rect = QRect(self.begin, self.end).normalized()
-
-            # 判定为点击还是拖拽
             if rect.width() < 10:
                 self.point_clicked.emit(self.map_to_image(self.end))
             else:
                 self.area_selected.emit(self.map_rect(rect))
-
         self.begin = None
         self.end = None
         self.update()
@@ -103,32 +95,55 @@ class ImageCanvas(QWidget):
         return QPoint(x, y)
 
     def map_rect(self, r):
-        x = int((r.x() - self.offset.x()) / self.scale)
-        y = int((r.y() - self.offset.y()) / self.scale)
-        w = int(r.width() / self.scale)
-        h = int(r.height() / self.scale)
+        x, y = int((r.x() - self.offset.x()) / self.scale), int((r.y() - self.offset.y()) / self.scale)
+        w, h = int(r.width() / self.scale), int(r.height() / self.scale)
         return QRect(x, y, w, h)
 
 
 # =========================
-# 🔥 分析线程
+# 🔥 分析线程核心逻辑 (抽离函数)
 # =========================
+def get_segment_result(model, img_raw, data, mode, device="cpu"):
+    h, w = img_raw.shape[:2]
+    img_display = img_raw.copy()
+    if mode == SelectMode.BOX:
+        x1, y1 = max(0, data.x()), max(0, data.y())
+        x2, y2 = min(w, data.right()), min(h, data.bottom())
+        ex = 0.3
+        wb, hb = x2 - x1, y2 - y1
+        x1e, y1e = max(0, int(x1 - wb * ex)), max(0, int(y1 - hb * ex))
+        x2e, y2e = min(w, int(x2 + wb * ex)), min(h, int(y2 + hb * ex))
+        roi = img_raw[y1e:y2e, x1e:x2e]
+    else:
+        x, y = np.clip(data.x(), 0, w - 1), np.clip(data.y(), 0, h - 1)
+        results = model.predict(source=img_raw, points=[[x, y]], labels=[1], device=device, retina_masks=True,
+                                verbose=False)
+        masks = results[0].masks.data
+        if masks is None or len(masks) == 0: return img_display, img_raw
+        mask_areas = sorted([(m.sum(), m) for m in masks], reverse=True, key=lambda x: x[0])
+        best = mask_areas[0][1]
+        second = mask_areas[1][1] if len(mask_areas) > 1 else None
+        combined = best | second if second is not None else best
+        mask_np = combined.cpu().numpy()
+        ys, xs = np.where(mask_np > 0)
+        x1, x2 = max(0, xs.min() - 25), min(w, xs.max() + 25)
+        y1, y2 = max(0, ys.min() - 25), min(h, ys.max() + 25)
+        roi = img_raw[y1:y2, x1:x2]
+        overlay = img_display.copy()
+        overlay[mask_np > 0] = [0, 0, 255]
+        cv2.addWeighted(overlay, 0.4, img_display, 0.6, 0, img_display)
+    return img_display, roi
+
+
 class AnalysisThread(QThread):
     segmentation_ready = pyqtSignal(np.ndarray)
     wiki_ready = pyqtSignal(str, str)
     roi_ready = pyqtSignal(np.ndarray)
+    _model = None
 
-    _model = None  # 静态变量共享模型
-
-    def __init__(self, vs, ds, anime, raw, mode, data, device_id=0):
+    def __init__(self, vs, ds, anime, raw, mode, data):
         super().__init__()
-        self.vs = vs
-        self.ds = ds
-        self.anime = anime
-        self.raw = raw
-        self.mode = mode
-        self.data = data
-        # 显存安全检查：优先使用 CUDA，报错时可手动切回 cpu
+        self.vs, self.ds, self.anime, self.raw, self.mode, self.data = vs, ds, anime, raw, mode, data
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
 
     def run(self):
@@ -137,86 +152,25 @@ class AnalysisThread(QThread):
             if AnalysisThread._model is None:
                 AnalysisThread._model = FastSAM("FastSAM-s.pt")
 
-            model = AnalysisThread._model
-            img_display = self.raw.copy()
-            h, w = self.raw.shape[:2]
-
-            if self.mode == SelectMode.BOX:
-                r = self.data
-                x1, y1 = max(0, r.x()), max(0, r.y())
-                x2, y2 = min(w, r.right()), min(h, r.bottom())
-
-                # 框选模式下的 ROI 扩展逻辑
-                expansion_factor = 0.3
-                w_box, h_box = x2 - x1, y2 - y1
-                x1_ex = max(0, int(x1 - w_box * expansion_factor))
-                y1_ex = max(0, int(y1 - h_box * expansion_factor))
-                x2_ex = min(w, int(x2 + w_box * expansion_factor))
-                y2_ex = min(h, int(y2 + h_box * expansion_factor))
-                roi = self.raw[y1_ex:y2_ex, x1_ex:x2_ex]
-
-            else:
-                # 点选模式逻辑
-                x, y = self.data.x(), self.data.y()
-                x, y = np.clip(x, 0, w - 1), np.clip(y, 0, h - 1)
-
-                results = model.predict(
-                    source=self.raw,
-                    points=[[x, y]],
-                    labels=[1],
-                    device=self.device,
-                    retina_masks=True,
-                    verbose=False
-                )
-
-                masks = results[0].masks.data
-                if masks is None or len(masks) == 0:
-                    raise Exception("未能分割出有效目标")
-
-                mask_areas = [(m.sum(), m) for m in masks]
-                mask_areas.sort(reverse=True, key=lambda x: x[0])
-
-                best_mask = mask_areas[0][1]
-                second_best = mask_areas[1][1] if len(mask_areas) > 1 else None
-                # 合并掩码以增加识别准确度
-                combined_mask = best_mask | second_best if second_best is not None else best_mask
-
-                mask_np = combined_mask.cpu().numpy()
-                ys, xs = np.where(mask_np > 0)
-
-                # 裁剪带边距的 ROI
-                x1, x2 = max(0, xs.min() - 25), min(w, xs.max() + 25)
-                y1, y2 = max(0, ys.min() - 25), min(h, ys.max() + 25)
-                roi = self.raw[y1:y2, x1:x2]
-
-                # 绘制分割反馈效果
-                overlay = img_display.copy()
-                overlay[mask_np > 0] = [0, 0, 255]
-                cv2.addWeighted(overlay, 0.4, img_display, 0.6, 0, img_display)
-
-            self.segmentation_ready.emit(img_display)
+            img_disp, roi = get_segment_result(AnalysisThread._model, self.raw, self.data, self.mode, self.device)
+            self.segmentation_ready.emit(img_disp)
             self.roi_ready.emit(roi)
 
-            # 💡 识别与百科逻辑
-            prompt = "如果图片背景为纯黑或有明显抠图痕迹，请忽略边缘干扰，重点分析主体轮廓及其与特定领域（如动漫/工业）的关联。"
-            result = self.anime.identify(roi, prompt=prompt)
+            res = self.anime.identify(roi, prompt="分析主体轮廓及其领域关联。")
+            name = res.get("name", "未知目标")
+            wiki = self.ds.get_wiki(name)
 
-            name = result.get("name", "未知目标")
-            candidates = result.get("candidates", [])
-            source_engine = result.get("source", "none")
+            info = f"引擎：{res.get('source', 'none').upper()}\n\n{wiki}"
+            if res.get("candidates"):
+                info += "\n\n【候选】\n" + "\n".join(res["candidates"])
 
-            wiki_content = self.ds.get_wiki(name)
-            extra_info = "\n\n【候选列表】\n" + "\n".join(candidates) if candidates else ""
-            final_text = f"识别引擎：{source_engine.upper()}\n\n{wiki_content}{extra_info}"
-
-            self.wiki_ready.emit(name, final_text)
-
+            self.wiki_ready.emit(name, info)
         except Exception as e:
-            self.wiki_ready.emit("分析中断", f"详细错误: {str(e)}")
+            self.wiki_ready.emit("错误", str(e))
 
 
 # =========================
-# 🧠 主窗口
+# 🧠 主窗口 (整合版)
 # =========================
 class App(QMainWindow):
     def __init__(self):
@@ -224,148 +178,199 @@ class App(QMainWindow):
         self.setWindowTitle("AI 百科（终极版）")
         self.resize(1200, 800)
 
-        # 引擎初始化（请确保 API Key 有效）
+        # 1. 引擎与逻辑初始化 (单例模式)
+        # 💡 在状态栏给用户反馈，因为启动 Chrome 需要时间
+        self.statusBar().showMessage("正在初始化语音引擎 (Loading Chrome)...")
+        QApplication.processEvents()  # 强制刷新界面显示状态栏
+
+        self.voice_mgr = VoiceManager()
         self.vs = VisionEngine(api_key="sk-df077d87d84d486e9c2a9e7964f3959a")
         self.ds = DeepSeekEngine(api_key="sk-52022cb4e05b491fa90576fb72756a74")
         self.anime = AnimeEngine(self.vs)
 
+        self.current_name = ""
+        self.current_wiki = ""
         self.mode = SelectMode.POINT
         self.raw = None
         self.thread = None
 
+        # 2. 构建界面
         self.init_ui()
         self.statusBar().showMessage("准备就绪 | 当前模式：点选")
 
     def init_ui(self):
+        # --- 菜单栏 ---
         menubar = self.menuBar()
-        file_menu = menubar.addMenu("文件(F)")
 
+        # 文件菜单
+        file_menu = menubar.addMenu("文件(F)")
         load_act = QAction("打开图片...", self)
         load_act.setShortcut("Ctrl+O")
         load_act.triggered.connect(self.load)
         file_menu.addAction(load_act)
 
-        exit_act = QAction("退出(E)", self)
-        exit_act.triggered.connect(self.close)
-        file_menu.addAction(exit_act)
-
-        mode_menu = menubar.addMenu("操作模式(M)")
+        # 模式菜单
+        mode_menu = menubar.addMenu("模式(M)")
         mode_group = QActionGroup(self)
         self.act_point = QAction("📍 点选模式", self, checkable=True)
         self.act_point.setChecked(True)
         self.act_point.triggered.connect(lambda: self.set_mode(SelectMode.POINT))
-
         self.act_box = QAction("🔲 框选模式", self, checkable=True)
         self.act_box.triggered.connect(lambda: self.set_mode(SelectMode.BOX))
+        for a in [self.act_point, self.act_box]:
+            mode_group.addAction(a)
+            mode_menu.addAction(a)
 
-        mode_group.addAction(self.act_point)
-        mode_group.addAction(self.act_box)
-        mode_menu.addAction(self.act_point)
-        mode_menu.addAction(self.act_box)
+        # 语音菜单
+        voice_menu = menubar.addMenu("语音(V)")
+        voice_configs = [("男声", "male"), ("女声", "female"), ("油库里", "yukkuri")]
+        for text, m in voice_configs:
+            act = QAction(text, self)
+            act.triggered.connect(lambda _, mode=m: self.voice_mgr.set_mode(mode))
+            voice_menu.addAction(act)
 
+        # --- 主布局 ---
         central = QWidget()
         self.setCentralWidget(central)
         layout = QHBoxLayout(central)
 
-        # 左侧：引导页与画布
-        left_layout = QVBoxLayout()
+        # 左侧：画布堆栈
         self.stack = QStackedWidget()
-
-        self.btn_select_first = QPushButton("📂 点击此处选择图片开始分析")
-        self.btn_select_first.setStyleSheet("""
-            QPushButton {
-                background-color: #282a36;
-                color: #6272a4;
-                font-size: 20px;
-                border: 2px dashed #44475a;
-                border-radius: 15px;
-            }
-            QPushButton:hover { background-color: #383a59; color: #f8f8f2; }
-        """)
+        self.btn_select_first = QPushButton("📂 点击载入图片")
+        self.btn_select_first.setStyleSheet("font-size: 20px; font-weight: bold;")
         self.btn_select_first.clicked.connect(self.load)
 
+        # 假设 ImageCanvas 类已在外部定义
         self.canvas = ImageCanvas()
+
+        # 💡 朗读按钮 (放置在画布之上)
+        self.btn_speak = QPushButton("🔊 朗读百科", self.canvas)
+        self.btn_speak.setFixedSize(100, 35)
+        self.btn_speak.move(20, 20)
+        self.btn_speak.setStyleSheet("""
+            QPushButton {
+                background: rgba(255, 255, 255, 180); 
+                border-radius: 5px; 
+                font-weight: bold;
+                border: 1px solid #ccc;
+            }
+            QPushButton:hover {
+                background: rgba(255, 255, 255, 255);
+                border: 1px solid #50FA7B;
+            }
+        """)
+        self.btn_speak.clicked.connect(self.on_speak_clicked)
+        self.btn_speak.hide()
+
         self.stack.addWidget(self.btn_select_first)
         self.stack.addWidget(self.canvas)
-        left_layout.addWidget(self.stack)
-        layout.addLayout(left_layout, 3)
+        layout.addWidget(self.stack, 3)
 
-        # 右侧：展示面板
-        side_layout = QVBoxLayout()
-        self.name_label = QLabel("等待操作...")
-        self.name_label.setStyleSheet("font-size: 20px; font-weight: bold; color: #50FA7B;")
+        # 右侧：信息面板
+        side = QVBoxLayout()
+        self.name_label = QLabel("等待...")
+        self.name_label.setStyleSheet("font-size:18px; color:#50FA7B; font-weight:bold;")
 
-        self.info_area = QLabel("请载入图片并点击目标进行分析。")
-        self.info_area.setWordWrap(True)
-        self.info_area.setAlignment(Qt.AlignmentFlag.AlignTop)
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setWidget(self.info_area)
+        self.info_area = QTextEdit()
+        self.info_area.setReadOnly(True)
+        self.info_area.setStyleSheet("background: #282a36; color: #f8f8f2; font-family: 'Microsoft YaHei';")
 
-        self.preview_label = QLabel("局部预览")
+        self.preview_label = QLabel()
         self.preview_label.setFixedSize(260, 160)
-        self.preview_label.setStyleSheet("border: 1px solid #444; background: #282a36;")
+        self.preview_label.setStyleSheet("border:1px solid #444; background:#282a36;")
+        self.preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
-        side_layout.addWidget(QLabel("【目标名称】"))
-        side_layout.addWidget(self.name_label)
-        side_layout.addWidget(QLabel("【百科详情】"))
-        side_layout.addWidget(scroll)
-        side_layout.addWidget(QLabel("【目标预览】"))
-        side_layout.addWidget(self.preview_label)
+        side.addWidget(QLabel("【目标名称】"))
+        side.addWidget(self.name_label)
+        side.addWidget(QLabel("【详细百科】"))
+        side.addWidget(self.info_area)
+        side.addWidget(QLabel("【分析预览】"))
+        side.addWidget(self.preview_label)
+        layout.addLayout(side, 1)
 
-        layout.addLayout(side_layout, 1)
-
+        # 信号连接
         self.canvas.area_selected.connect(self.on_box)
         self.canvas.point_clicked.connect(self.on_point)
 
     def load(self):
-        path, _ = QFileDialog.getOpenFileName(self, "选择图片", "", "Images (*.png *.jpg *.jpeg *.bmp)")
+        path, _ = QFileDialog.getOpenFileName(self, "选择图片", "", "Images (*.png *.jpg *.jpeg)")
         if path:
             self.raw = cv2.imread(path)
-            if self.raw is not None:
-                self.canvas.set_image(self.raw)
-                self.stack.setCurrentIndex(1)
-                self.statusBar().showMessage(f"已加载: {os.path.basename(path)}")
+            self.canvas.set_image(self.raw)
+            self.stack.setCurrentIndex(1)
 
     def set_mode(self, m):
         self.mode = m
         self.statusBar().showMessage(f"当前模式：{'点选' if m == SelectMode.POINT else '框选'}")
 
-    def on_box(self, rect):
-        if self.mode == SelectMode.BOX: self.start(rect)
+    def on_box(self, r):
+        if self.mode == SelectMode.BOX: self.start(r)
 
     def on_point(self, p):
         if self.mode == SelectMode.POINT: self.start(p)
 
     def start(self, data):
         if self.raw is None: return
-
-        # 线程安全：如果已有线程在跑，先停止它
+        # 如果当前有正在运行的分析线程，先停止它
         if self.thread and self.thread.isRunning():
-            self.thread.terminate()  # 强制停止以响应新点击
+            self.thread.terminate()
             self.thread.wait()
 
-        self.statusBar().showMessage("AI 正在分析中...")
-        # 💡 正确传递参数给构造函数
         self.thread = AnalysisThread(self.vs, self.ds, self.anime, self.raw, self.mode, data)
         self.thread.segmentation_ready.connect(self.canvas.set_image)
         self.thread.roi_ready.connect(self.show_roi)
         self.thread.wiki_ready.connect(self.show_text)
-        self.thread.finished.connect(lambda: self.statusBar().showMessage("分析完成"))
         self.thread.start()
 
     def show_roi(self, roi):
-        if roi is None or roi.size == 0: return
         rgb = cv2.cvtColor(roi, cv2.COLOR_BGR2RGB)
         h, w = roi.shape[:2]
         qimg = QImage(rgb.data, w, h, w * 3, QImage.Format.Format_RGB888)
-        self.preview_label.setPixmap(QPixmap.fromImage(qimg).scaled(
-            self.preview_label.size(), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
+        self.preview_label.setPixmap(QPixmap.fromImage(qimg).scaled(260, 160, Qt.AspectRatioMode.KeepAspectRatio))
 
     def show_text(self, n, w):
         self.name_label.setText(n)
         self.info_area.setText(w)
+        self.current_name, self.current_wiki = n, w
+        self.btn_speak.show()
 
+    def on_speak_clicked(self):
+        """朗读正文的第一句话，带状态保护"""
+        if self.voice_mgr.is_playing:
+            self.statusBar().showMessage("🕒 语音引擎正在忙碌...")
+            return
+
+        if self.current_name and self.current_wiki:
+            # 停止当前可能存在的残留播放
+            import pygame
+            try:
+                if pygame.mixer.get_init():
+                    pygame.mixer.music.stop()
+            except:
+                pass
+
+            # 解析文本：跳过“引擎：XXX”标注，提取正文
+            parts = self.current_wiki.split('\n\n')
+            # 假设格式是：[0]引擎信息 [1]百科内容
+            main_text = parts[1] if len(parts) > 1 else parts[0]
+
+            # 只取第一句
+            intro = main_text.split('。')[0]
+            if not intro.strip():
+                intro = self.current_name
+
+            full_speech = f"识别结果：{self.current_name}。{intro}"
+
+            self.statusBar().showMessage(f"🎙️ 正在播放：{self.current_name}")
+            self.voice_mgr.speak(full_speech)
+
+    def closeEvent(self, event):
+        """窗口关闭时彻底杀死后台驱动，防止残留进程"""
+        print("正在关闭应用，释放资源...")
+        self.statusBar().showMessage("正在清理后台进程...")
+        if hasattr(self, 'voice_mgr'):
+            self.voice_mgr.quit()
+        event.accept()
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
