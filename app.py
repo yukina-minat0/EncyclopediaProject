@@ -4,6 +4,7 @@ import cv2
 import torch
 import numpy as np
 import time
+import ctypes  # 用于设置 Windows 任务栏 ID
 from enum import Enum
 
 from PyQt6.QtWidgets import *
@@ -18,6 +19,16 @@ from voice_manager import VoiceManager
 
 # 限制线程数
 torch.set_num_threads(1)
+
+
+# =========================
+# 📦 资源路径转换函数
+# =========================
+def get_resource_path(relative_path):
+    """ 获取资源绝对路径，兼容 PyInstaller 打包后的环境 """
+    if hasattr(sys, '_MEIPASS'):
+        return os.path.join(sys._MEIPASS, relative_path)
+    return os.path.join(os.path.abspath("."), relative_path)
 
 
 class SelectMode(Enum):
@@ -39,7 +50,6 @@ class ChatThread(QThread):
 
     def run(self):
         try:
-            # 这里的逻辑是向 DeepSeek 发送带上下文的 Prompt
             prompt = f"背景资料：{self.context}\n\n问题：{self.question}"
             res = self.engine.get_wiki(prompt)
             self.answer_ready.emit(res)
@@ -193,13 +203,13 @@ class AnalysisThread(QThread):
         try:
             from ultralytics import FastSAM
             if AnalysisThread._model is None:
-                AnalysisThread._model = FastSAM("FastSAM-s.pt")
+                model_full_path = get_resource_path("FastSAM-s.pt")
+                AnalysisThread._model = FastSAM(model_full_path)
 
             img_disp, roi = get_segment_result(AnalysisThread._model, self.raw, self.data, self.mode, self.device)
             self.segmentation_ready.emit(img_disp)
             self.roi_ready.emit(roi)
 
-            # ⭐ 修正：调用 identify_object 而非 identify
             check_prompt = "请判断图片中的主体是否属于动漫、二次元或插画风格？如果是，请只回答'YES'；如果不是，请直接给出该物体的中文名称。"
             v_name = self.vs.identify_object(roi, prompt=check_prompt)
             v_text = v_name.strip().upper()
@@ -208,7 +218,6 @@ class AnalysisThread(QThread):
             source_engine = "VISION"
 
             if "YES" in v_text:
-                # 判定为二次元，调用 Anime 引擎并带重试逻辑
                 max_retries = 3
                 for i in range(max_retries):
                     try:
@@ -217,13 +226,11 @@ class AnalysisThread(QThread):
                         source_engine = "ANIME"
                         if name and name != "未知目标": break
                     except Exception as e:
-                        print(f"Anime API 第 {i+1} 次尝试失败: {e}")
+                        print(f"Anime API 第 {i + 1} 次尝试失败: {e}")
                         if i == max_retries - 1:
-                            # 三次全败，由 Vision 兜底识别具体名字
                             name = self.vs.identify_object(roi, prompt="这是一个动漫角色，请告诉我它的具体名字。")
                 if not name: name = "动漫人物"
             else:
-                # 判定为非二次元，直接使用 Vision 刚才识别到的物体名称
                 name = v_name
                 source_engine = "VISION"
 
@@ -244,10 +251,14 @@ class App(QMainWindow):
         self.setWindowTitle("AI 百科（终极版）")
         self.resize(1280, 850)
 
+        # ⭐ 设置窗口图标（logo.png 需在打包参数 --add-data 中包含）
+        self.setWindowIcon(QIcon(get_resource_path("logo.png")))
+
         self.statusBar().showMessage("正在初始化引擎...")
         QApplication.processEvents()
 
         self.voice_mgr = VoiceManager()
+
         self.vs = VisionEngine(api_key="sk-df077d87d84d486e9c2a9e7964f3959a")
         self.ds = DeepSeekEngine(api_key="sk-52022cb4e05b491fa90576fb72756a74")
         self.anime = AnimeEngine(self.vs)
@@ -264,7 +275,6 @@ class App(QMainWindow):
         self.statusBar().showMessage("就绪 | 当前模式：点选")
 
     def init_ui(self):
-        # --- 菜单栏 ---
         menubar = self.menuBar()
         file_menu = menubar.addMenu("文件(F)")
 
@@ -296,12 +306,10 @@ class App(QMainWindow):
             act.triggered.connect(lambda _, mode=m: self.voice_mgr.set_mode(mode))
             voice_menu.addAction(act)
 
-        # --- 主布局 ---
         central = QWidget()
         self.setCentralWidget(central)
         layout = QHBoxLayout(central)
 
-        # 左侧：核心工作区
         self.stack = QStackedWidget()
         self.welcome_widget = QWidget()
         welcome_layout = QHBoxLayout(self.welcome_widget)
@@ -352,7 +360,6 @@ class App(QMainWindow):
         self.stack.addWidget(self.canvas)
         layout.addWidget(self.stack, 3)
 
-        # 右侧：信息面板
         side = QVBoxLayout()
         self.name_label = QLabel("等待...")
         self.name_label.setStyleSheet("font-size:18px; color:#50FA7B; font-weight:bold;")
@@ -366,7 +373,6 @@ class App(QMainWindow):
         self.preview_label.setStyleSheet("border:1px solid #444; background:#282a36;")
         self.preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
-        # --- 提问交互区 ---
         self.ask_label = QLabel("【向百科提问】")
         chat_layout = QHBoxLayout()
         self.chat_input = QLineEdit()
@@ -528,6 +534,13 @@ class App(QMainWindow):
 
 
 if __name__ == "__main__":
+    # ⭐ 声明独立的 App ID，确保任务栏图标显示正确
+    try:
+        my_appid = 'myteam.encyclopedia.v1.0'
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(my_appid)
+    except:
+        pass
+
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
     win = App()
