@@ -3,6 +3,7 @@ import sys
 import cv2
 import torch
 import numpy as np
+import time
 from enum import Enum
 
 from PyQt6.QtWidgets import *
@@ -18,10 +19,6 @@ from voice_manager import VoiceManager
 # 限制线程数
 torch.set_num_threads(1)
 
-class SelectMode(Enum):
-    BOX = 0
-    POINT = 1
-
 
 class SelectMode(Enum):
     BOX = 0
@@ -29,7 +26,53 @@ class SelectMode(Enum):
 
 
 # =========================
-# 🎨 自绘画布 (保持原样)
+# 💬 对话处理线程
+# =========================
+class ChatThread(QThread):
+    answer_ready = pyqtSignal(str)
+
+    def __init__(self, engine, context, question):
+        super().__init__()
+        self.engine = engine
+        self.context = context
+        self.question = question
+
+    def run(self):
+        try:
+            # 这里的逻辑是向 DeepSeek 发送带上下文的 Prompt
+            prompt = f"背景资料：{self.context}\n\n问题：{self.question}"
+            res = self.engine.get_wiki(prompt)
+            self.answer_ready.emit(res)
+        except Exception as e:
+            self.answer_ready.emit(f"对话出错: {str(e)}")
+
+
+# =========================
+# 📷 摄像头线程
+# =========================
+class CameraThread(QThread):
+    frame_ready = pyqtSignal(np.ndarray)
+
+    def __init__(self):
+        super().__init__()
+        self.running = True
+
+    def run(self):
+        cap = cv2.VideoCapture(0)
+        while self.running:
+            ret, frame = cap.read()
+            if ret:
+                self.frame_ready.emit(frame)
+            self.msleep(33)
+        cap.release()
+
+    def stop(self):
+        self.running = False
+        self.wait()
+
+
+# =========================
+# 🎨 自绘画布
 # =========================
 class ImageCanvas(QWidget):
     area_selected = pyqtSignal(QRect)
@@ -101,7 +144,7 @@ class ImageCanvas(QWidget):
 
 
 # =========================
-# 🔥 分析线程核心逻辑 (抽离函数)
+# 🔥 分析线程核心逻辑
 # =========================
 def get_segment_result(model, img_raw, data, mode, device="cpu"):
     h, w = img_raw.shape[:2]
@@ -156,32 +199,53 @@ class AnalysisThread(QThread):
             self.segmentation_ready.emit(img_disp)
             self.roi_ready.emit(roi)
 
-            res = self.anime.identify(roi, prompt="分析主体轮廓及其领域关联。")
-            name = res.get("name", "未知目标")
+            # ⭐ 修正：调用 identify_object 而非 identify
+            check_prompt = "请判断图片中的主体是否属于动漫、二次元或插画风格？如果是，请只回答'YES'；如果不是，请直接给出该物体的中文名称。"
+            v_name = self.vs.identify_object(roi, prompt=check_prompt)
+            v_text = v_name.strip().upper()
+
+            name = ""
+            source_engine = "VISION"
+
+            if "YES" in v_text:
+                # 判定为二次元，调用 Anime 引擎并带重试逻辑
+                max_retries = 3
+                for i in range(max_retries):
+                    try:
+                        res = self.anime.identify(roi, prompt="分析主体轮廓及其领域关联。")
+                        name = res.get("name")
+                        source_engine = "ANIME"
+                        if name and name != "未知目标": break
+                    except Exception as e:
+                        print(f"Anime API 第 {i+1} 次尝试失败: {e}")
+                        if i == max_retries - 1:
+                            # 三次全败，由 Vision 兜底识别具体名字
+                            name = self.vs.identify_object(roi, prompt="这是一个动漫角色，请告诉我它的具体名字。")
+                if not name: name = "动漫人物"
+            else:
+                # 判定为非二次元，直接使用 Vision 刚才识别到的物体名称
+                name = v_name
+                source_engine = "VISION"
+
             wiki = self.ds.get_wiki(name)
-
-            info = f"引擎：{res.get('source', 'none').upper()}\n\n{wiki}"
-            if res.get("candidates"):
-                info += "\n\n【候选】\n" + "\n".join(res["candidates"])
-
+            info = f"引擎：{source_engine}\n\n{wiki}"
             self.wiki_ready.emit(name, info)
+
         except Exception as e:
             self.wiki_ready.emit("错误", str(e))
 
 
 # =========================
-# 🧠 主窗口 (整合版)
+# 🧠 主窗口
 # =========================
 class App(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("AI 百科（终极版）")
-        self.resize(1200, 800)
+        self.resize(1280, 850)
 
-        # 1. 引擎与逻辑初始化 (单例模式)
-        # 💡 在状态栏给用户反馈，因为启动 Chrome 需要时间
-        self.statusBar().showMessage("正在初始化语音引擎 (Loading Chrome)...")
-        QApplication.processEvents()  # 强制刷新界面显示状态栏
+        self.statusBar().showMessage("正在初始化引擎...")
+        QApplication.processEvents()
 
         self.voice_mgr = VoiceManager()
         self.vs = VisionEngine(api_key="sk-df077d87d84d486e9c2a9e7964f3959a")
@@ -193,23 +257,27 @@ class App(QMainWindow):
         self.mode = SelectMode.POINT
         self.raw = None
         self.thread = None
+        self.camera_thread = None
+        self.chat_thread = None
 
-        # 2. 构建界面
         self.init_ui()
-        self.statusBar().showMessage("准备就绪 | 当前模式：点选")
+        self.statusBar().showMessage("就绪 | 当前模式：点选")
 
     def init_ui(self):
         # --- 菜单栏 ---
         menubar = self.menuBar()
-
-        # 文件菜单
         file_menu = menubar.addMenu("文件(F)")
-        load_act = QAction("打开图片...", self)
+
+        load_act = QAction("📂 打开图片...", self)
         load_act.setShortcut("Ctrl+O")
         load_act.triggered.connect(self.load)
         file_menu.addAction(load_act)
 
-        # 模式菜单
+        camera_act = QAction("📷 开启摄像头", self)
+        camera_act.setShortcut("Ctrl+K")
+        camera_act.triggered.connect(self.toggle_camera)
+        file_menu.addAction(camera_act)
+
         mode_menu = menubar.addMenu("模式(M)")
         mode_group = QActionGroup(self)
         self.act_point = QAction("📍 点选模式", self, checkable=True)
@@ -221,7 +289,6 @@ class App(QMainWindow):
             mode_group.addAction(a)
             mode_menu.addAction(a)
 
-        # 语音菜单
         voice_menu = menubar.addMenu("语音(V)")
         voice_configs = [("男声", "male"), ("女声", "female"), ("油库里", "yukkuri")]
         for text, m in voice_configs:
@@ -234,35 +301,54 @@ class App(QMainWindow):
         self.setCentralWidget(central)
         layout = QHBoxLayout(central)
 
-        # 左侧：画布堆栈
+        # 左侧：核心工作区
         self.stack = QStackedWidget()
-        self.btn_select_first = QPushButton("📂 点击载入图片")
-        self.btn_select_first.setStyleSheet("font-size: 20px; font-weight: bold;")
-        self.btn_select_first.clicked.connect(self.load)
+        self.welcome_widget = QWidget()
+        welcome_layout = QHBoxLayout(self.welcome_widget)
+        welcome_layout.setSpacing(15)
 
-        # 假设 ImageCanvas 类已在外部定义
-        self.canvas = ImageCanvas()
-
-        # 💡 朗读按钮 (放置在画布之上)
-        self.btn_speak = QPushButton("🔊 朗读百科", self.canvas)
-        self.btn_speak.setFixedSize(100, 35)
-        self.btn_speak.move(20, 20)
-        self.btn_speak.setStyleSheet("""
+        btn_style = """
             QPushButton {
-                background: rgba(255, 255, 255, 180); 
-                border-radius: 5px; 
+                background-color: #3b3e4e;
+                color: #f8f8f2;
+                border: 2px solid #44475a;
+                border-radius: 12px;
+                font-size: 26px;
                 font-weight: bold;
-                border: 1px solid #ccc;
             }
             QPushButton:hover {
-                background: rgba(255, 255, 255, 255);
-                border: 1px solid #50FA7B;
+                background-color: #50fa7b;
+                color: #282a36;
+                border: 2px solid #50fa7b;
             }
-        """)
+        """
+
+        self.btn_open_file = QPushButton("📂\n点击载入图片")
+        self.btn_open_file.setStyleSheet(btn_style)
+        self.btn_open_file.clicked.connect(self.load)
+        self.btn_open_camera = QPushButton("📷\n调用摄像头拍照")
+        self.btn_open_camera.setStyleSheet(btn_style)
+        self.btn_open_camera.clicked.connect(self.toggle_camera)
+
+        welcome_layout.addWidget(self.btn_open_file)
+        welcome_layout.addWidget(self.btn_open_camera)
+
+        self.canvas = ImageCanvas()
+        self.btn_speak = QPushButton("🔊 朗读百科", self.canvas)
+        self.btn_speak.setFixedSize(110, 35)
+        self.btn_speak.move(20, 20)
+        self.btn_speak.setStyleSheet("background: rgba(255,255,255,180); border-radius:5px; font-weight:bold;")
         self.btn_speak.clicked.connect(self.on_speak_clicked)
         self.btn_speak.hide()
 
-        self.stack.addWidget(self.btn_select_first)
+        self.btn_capture = QPushButton("📸 拍摄当前画面", self.canvas)
+        self.btn_capture.setFixedSize(140, 40)
+        self.btn_capture.move(20, 65)
+        self.btn_capture.setStyleSheet("background: #ff5555; color: white; border-radius:5px; font-weight:bold;")
+        self.btn_capture.clicked.connect(self.capture_photo)
+        self.btn_capture.hide()
+
+        self.stack.addWidget(self.welcome_widget)
         self.stack.addWidget(self.canvas)
         layout.addWidget(self.stack, 3)
 
@@ -280,28 +366,95 @@ class App(QMainWindow):
         self.preview_label.setStyleSheet("border:1px solid #444; background:#282a36;")
         self.preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
+        # --- 提问交互区 ---
+        self.ask_label = QLabel("【向百科提问】")
+        chat_layout = QHBoxLayout()
+        self.chat_input = QLineEdit()
+        self.chat_input.setPlaceholderText("请输入您想追问的内容...")
+        self.chat_input.setStyleSheet(
+            "height: 35px; border-radius: 5px; padding: 5px; background: #3b3e4e; color: white;")
+        self.chat_input.returnPressed.connect(self.on_ask_clicked)
+
+        self.btn_send_ask = QPushButton("🚀")
+        self.btn_send_ask.setFixedSize(35, 35)
+        self.btn_send_ask.setStyleSheet("background: #50fa7b; color: #282a36; border-radius: 5px; font-weight: bold;")
+        self.btn_send_ask.clicked.connect(self.on_ask_clicked)
+
+        chat_layout.addWidget(self.chat_input)
+        chat_layout.addWidget(self.btn_send_ask)
+
         side.addWidget(QLabel("【目标名称】"))
         side.addWidget(self.name_label)
         side.addWidget(QLabel("【详细百科】"))
-        side.addWidget(self.info_area)
+        side.addWidget(self.info_area, 3)
+
+        side.addWidget(self.ask_label)
+        side.addLayout(chat_layout)
+
         side.addWidget(QLabel("【分析预览】"))
         side.addWidget(self.preview_label)
         layout.addLayout(side, 1)
 
-        # 信号连接
         self.canvas.area_selected.connect(self.on_box)
         self.canvas.point_clicked.connect(self.on_point)
 
+    # ================= 业务逻辑 =================
+    def on_ask_clicked(self):
+        text = self.chat_input.text().strip()
+        if not text: return
+        if not self.current_wiki:
+            self.statusBar().showMessage("❌ 请先识别一个目标后再提问")
+            return
+
+        self.info_area.append(f"\n🙋‍♂️ **提问**：{text}")
+        self.chat_input.clear()
+        self.statusBar().showMessage("🤖 AI 正在深入思考...")
+
+        if self.chat_thread and self.chat_thread.isRunning():
+            self.chat_thread.terminate()
+
+        self.chat_thread = ChatThread(self.ds, self.current_wiki, text)
+        self.chat_thread.answer_ready.connect(self.on_answer_ready)
+        self.chat_thread.start()
+
+    def on_answer_ready(self, answer):
+        self.info_area.append(f"\n💡 **回答**：{answer}")
+        self.info_area.moveCursor(QTextCursor.MoveOperation.End)
+        self.statusBar().showMessage("✅ 回答完毕")
+
+    def toggle_camera(self):
+        self.stop_analysis()
+        self.stack.setCurrentIndex(1)
+        self.btn_capture.show()
+        self.btn_speak.hide()
+        if self.camera_thread and self.camera_thread.isRunning(): return
+        self.camera_thread = CameraThread()
+        self.camera_thread.frame_ready.connect(self.canvas.set_image)
+        self.camera_thread.start()
+
+    def capture_photo(self):
+        if self.camera_thread:
+            self.raw = self.canvas.image.copy()
+            self.stop_camera()
+            self.btn_capture.hide()
+            self.statusBar().showMessage("✅ 拍照成功！")
+
+    def stop_camera(self):
+        if self.camera_thread:
+            self.camera_thread.stop()
+            self.camera_thread = None
+
     def load(self):
+        self.stop_camera()
         path, _ = QFileDialog.getOpenFileName(self, "选择图片", "", "Images (*.png *.jpg *.jpeg)")
         if path:
             self.raw = cv2.imread(path)
             self.canvas.set_image(self.raw)
             self.stack.setCurrentIndex(1)
+            self.btn_capture.hide()
 
     def set_mode(self, m):
         self.mode = m
-        self.statusBar().showMessage(f"当前模式：{'点选' if m == SelectMode.POINT else '框选'}")
 
     def on_box(self, r):
         if self.mode == SelectMode.BOX: self.start(r)
@@ -309,13 +462,15 @@ class App(QMainWindow):
     def on_point(self, p):
         if self.mode == SelectMode.POINT: self.start(p)
 
-    def start(self, data):
-        if self.raw is None: return
-        # 如果当前有正在运行的分析线程，先停止它
+    def stop_analysis(self):
         if self.thread and self.thread.isRunning():
             self.thread.terminate()
             self.thread.wait()
 
+    def start(self, data):
+        if self.raw is None: return
+        self.stop_camera()
+        self.stop_analysis()
         self.thread = AnalysisThread(self.vs, self.ds, self.anime, self.raw, self.mode, data)
         self.thread.segmentation_ready.connect(self.canvas.set_image)
         self.thread.roi_ready.connect(self.show_roi)
@@ -324,8 +479,7 @@ class App(QMainWindow):
 
     def show_roi(self, roi):
         rgb = cv2.cvtColor(roi, cv2.COLOR_BGR2RGB)
-        h, w = roi.shape[:2]
-        qimg = QImage(rgb.data, w, h, w * 3, QImage.Format.Format_RGB888)
+        qimg = QImage(rgb.data, roi.shape[1], roi.shape[0], roi.shape[1] * 3, QImage.Format.Format_RGB888)
         self.preview_label.setPixmap(QPixmap.fromImage(qimg).scaled(260, 160, Qt.AspectRatioMode.KeepAspectRatio))
 
     def show_text(self, n, w):
@@ -335,53 +489,43 @@ class App(QMainWindow):
         self.btn_speak.show()
 
     def on_speak_clicked(self):
-        """朗读正文全文，既然 Prompt 已经优化过长度"""
         if self.voice_mgr.is_playing:
-            self.statusBar().showMessage("🕒 语音引擎正在忙碌...")
+            self.stop_voice()
             return
-
         if self.current_name and self.current_wiki:
-            # 1. 停止当前可能存在的残留播放
             import pygame
             try:
-                if pygame.mixer.get_init():
-                    pygame.mixer.music.stop()
+                if pygame.mixer.get_init(): pygame.mixer.music.stop()
             except:
                 pass
-
-            # 2. 解析文本：跳过“引擎：XXX”这种元数据标注
-            # 假设你的格式依然是：引擎信息 \n\n 百科内容 \n\n 候选
             parts = self.current_wiki.split('\n\n')
-
-            # 找到真正的百科描述部分
-            # 我们排除掉第一行（引擎名）和包含“【候选】”的部分
-            main_content_parts = []
-            for p in parts:
-                p = p.strip()
-                if not p.startswith("引擎：") and not p.startswith("【候选】"):
-                    main_content_parts.append(p)
-
-            # 合并剩下的正文
-            full_content = " ".join(main_content_parts)
-
-            # 如果正文解析失败，至少读个名字
-            if not full_content.strip():
-                full_content = self.current_name
-
-            # 3. 拼接最终要读的话
-            # 不再使用 .split('。')[0]，直接读全文
-            full_speech = f"识别结果：{self.current_name}。{full_content}"
-
-            self.statusBar().showMessage(f"🎙️ 正在播放：{self.current_name}")
+            main_content_parts = [p.strip() for p in parts if not p.strip().startswith(("引擎：", "【候选】"))]
+            full_speech = f"识别结果：{self.current_name}。{' '.join(main_content_parts)}"
             self.voice_mgr.speak(full_speech)
+            self.btn_speak.setText("⏹️ 停止播放")
+            self.btn_speak.setStyleSheet("background: #ff5555; color: white; border-radius:5px; font-weight:bold;")
+            self.status_timer = QTimer(self)
+            self.status_timer.timeout.connect(self.check_voice_status)
+            self.status_timer.start(500)
+
+    def stop_voice(self):
+        self.voice_mgr.quit()
+        self.voice_mgr = VoiceManager()
+        self.btn_speak.setText("🔊 朗读百科")
+        self.btn_speak.setStyleSheet("background: rgba(255,255,255,180); border-radius:5px; font-weight:bold;")
+        if hasattr(self, 'status_timer'): self.status_timer.stop()
+
+    def check_voice_status(self):
+        if not self.voice_mgr.is_playing:
+            self.btn_speak.setText("🔊 朗读百科")
+            self.btn_speak.setStyleSheet("background: rgba(255,255,255,180); border-radius:5px; font-weight:bold;")
+            if hasattr(self, 'status_timer'): self.status_timer.stop()
 
     def closeEvent(self, event):
-        """窗口关闭时彻底杀死后台驱动，防止残留进程"""
-        print("正在关闭应用，释放资源...")
-        self.statusBar().showMessage("正在清理后台进程...")
-        if hasattr(self, 'voice_mgr'):
-            self.voice_mgr.quit()
+        self.stop_camera()
+        if hasattr(self, 'voice_mgr'): self.voice_mgr.quit()
         event.accept()
+
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
